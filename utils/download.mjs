@@ -23,12 +23,12 @@ async function main() {
   console.log("=== 1. Downloading metadata and labels ===");
 
   // 1. Fetch manifest.json
-  const manifestRel = "/data/tiles/manifest.json";
+  const manifestRel = "../data/tiles/manifest.json";
   const manifestLocal = path.join(process.cwd(), "public", manifestRel);
   await downloadFile(manifestRel, manifestLocal);
 
   // 2. Fetch country labels
-  const labelsRel = "/data/flatmap/labels.json";
+  const labelsRel = "../data/flatmap/labels.json";
   const labelsLocal = path.join(process.cwd(), "public", labelsRel);
   await downloadFile(labelsRel, labelsLocal);
 
@@ -42,7 +42,7 @@ async function main() {
 
     for (let y = 0; y < rows; y++) {
       for (let x = 0; x < cols; x++) {
-        const tileRel = `/data/tiles/${z}/${x}_${y}.json`;
+        const tileRel = `../data/tiles/${z}/${x}_${y}.json`;
         const tileLocal = path.join(process.cwd(), "public", tileRel);
 
         // Skip if tile is already cached locally
