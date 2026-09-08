@@ -1,66 +1,29 @@
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>SaltedC137</title>
-  <style>
-    :root {
-      color-scheme: light dark;
-    }
-    * { margin: 0; box-sizing: border-box; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-      line-height: 1.7;
-      color: #24292f;
-      background: #fff;
-      max-width: 640px;
-      margin: 0 auto;
-      padding: 4rem 1.5rem;
-    }
-    h1 { font-size: 1.8rem; font-weight: 700; margin-bottom: .3rem; }
-    .role { color: #57606a; margin-bottom: 2.5rem; }
-    section { margin-bottom: 2.5rem; }
-    h2 {
-      font-size: .85rem;
-      text-transform: uppercase;
-      letter-spacing: .08em;
-      color: #57606a;
-      margin-bottom: .8rem;
-    }
-    p { color: #24292f; }
-    ul { list-style: none; padding: 0; }
-    li { margin-bottom: .4rem; }
-    a { color: #0969da; text-decoration: none; }
-    a:hover { text-decoration: underline; }
-
-    @media (prefers-color-scheme: dark) {
-      body { color: #e6edf3; background: #0d1117; }
-      .role, h2 { color: #8b949e; }
-      p { color: #e6edf3; }
-      a { color: #58a6ff; }
-    }
-  </style>
-</head>
-<body>
-  <header>
-    <h1>SaltedC137</h1>
-    <p class="role">Developer &middot; based somewhere on Earth</p>
-  </header>
-
-  <main>
-    <section>
-      <h2>About</h2>
-      <p>Hi, I'm SaltedC137. I build things with code, mostly on the web. This is my little corner of the internet.</p>
-    </section>
-
-    <section>
-      <h2>Links</h2>
-      <ul>
-        <li><a href="https://github.com/SaltedC137">GitHub</a></li>
-        <li><a href="mailto:hello@example.com">Email</a></li>
-      </ul>
-    </section>
-  </main>
-</body>
+<!DOCTYPE html>
+<html>
+  <head>
+    <script type="module" src="https://esm.sh/glyphcss/elements"></script>
+    <style>
+      /* Cell font-size sets the ASCII resolution; auto-size fills the box. */
+      glyph-scene { display: block; width: 100%; height: 100vh; font-size: 13px; }
+    </style>
+  </head>
+  <body>
+    <glyph-perspective-camera rot-x="65" rot-y="299.8" zoom="4.55" distance="32000">
+      <glyph-scene
+        mode="solid"
+        auto-size
+        glyph-palette="default"
+        use-colors="true"
+        line-height="1"
+        light-direction="0.64,0.76,0.12"
+        light-intensity="0.95"
+        light-color="#ffffff"
+        ambient-intensity="0.75"
+        ambient-color="#ffffff"
+      >
+        <glyph-orbit-controls drag wheel></glyph-orbit-controls>
+        <glyph-mesh geometry="cube" size="100" auto-center></glyph-mesh>
+      </glyph-scene>
+    </glyph-perspective-camera>
+  </body>
 </html>
