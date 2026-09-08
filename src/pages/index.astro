@@ -113,6 +113,18 @@ const description = "ETOPO1 global topography rasterised into ASCII. Isometric, 
 </head>
 
 <body>
+  <div class="ex-layout">
+    <div class="ex-main">
+      <div class="map-shell">
+        <div class="map-stage">
+          <div class="globe-host" id="globe-host">
+            <div class="loading" id="loading">Loading topography data…</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <script>
     import {
       createGlyphScene,
