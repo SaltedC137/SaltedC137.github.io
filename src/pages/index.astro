@@ -47,25 +47,6 @@ const description = "ETOPO1 global topography rasterised into ASCII. Isometric, 
       flex-direction: column;
     }
 
-    .map-head {
-      padding: 24px 32px 12px;
-      border-bottom: 1px solid rgba(255, 232, 184, 0.12);
-    }
-
-    .map-head h1 {
-      margin: 0;
-      font-size: 22px;
-      color: rgba(255, 232, 184, 0.94);
-      font-weight: 600;
-      letter-spacing: 0.04em;
-    }
-
-    .map-head p {
-      margin: 6px 0 0;
-      font-size: 13px;
-      color: rgba(255, 232, 184, 0.55);
-    }
-
     .map-stage {
       flex: 1;
       min-height: 0;
@@ -88,16 +69,6 @@ const description = "ETOPO1 global topography rasterised into ASCII. Isometric, 
 
     .globe-host .glyph-output:active {
       cursor: grabbing;
-    }
-
-    .map-foot {
-      padding: 14px 32px;
-      border-top: 1px solid rgba(255, 232, 184, 0.12);
-      font-size: 11px;
-      color: rgba(255, 232, 184, 0.45);
-      display: flex;
-      gap: 18px;
-      flex-wrap: wrap;
     }
 
     .loading {
@@ -129,7 +100,7 @@ const description = "ETOPO1 global topography rasterised into ASCII. Isometric, 
     import {
       createGlyphScene,
       createGlyphOrthographicCamera,
-    } from "glyphcss";
+    } from "https://esm.sh/glyphcss";
 
     type Polygon = { vertices: [number, number, number][]; color?: string };
     type MeshHandle = { dispose(): void; setTransform(t: unknown): void };
