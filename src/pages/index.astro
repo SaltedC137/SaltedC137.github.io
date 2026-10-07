@@ -1,83 +1,53 @@
 ---
-// Astro frontmatter
-const title = "glyphcss · ASCII Earth";
+const title = "ASCII Earth";
 const description = "ETOPO1 global topography rasterised into ASCII. Isometric, drag to orbit.";
+const blogUrl = `${import.meta.env.BASE_URL}blog/`;
 ---
 
 <!DOCTYPE html>
 <html lang="en">
-
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>{title}</title>
   <meta name="description" content={description} />
   <style>
-    html,
-    body {
+    html, body {
       background: #03050a;
       color: #e2e8f0;
       margin: 0;
       min-height: 100vh;
       font-family: ui-monospace, "JetBrains Mono", "SF Mono", monospace;
     }
-
-    body {
-      display: flex;
-      overflow: hidden;
-    }
-
-    .ex-layout {
-      position: fixed;
-      inset: 0;
-      display: flex;
-      min-width: 0;
-    }
-
-    .ex-main {
-      flex: 1;
-      min-width: 0;
-      display: flex;
-      flex-direction: column;
-    }
-
-    .map-shell {
-      flex: 1;
-      display: flex;
-      flex-direction: column;
-    }
-
-    .map-stage {
-      flex: 1;
-      min-height: 0;
-      position: relative;
-    }
-
+    body { overflow: hidden; }
     .globe-host {
-      position: absolute;
+      position: fixed;
       inset: 0;
       overflow: hidden;
       touch-action: none;
       contain: layout paint;
     }
-
-    .globe-host .glyph-scene {
-      isolation: isolate;
-    }
-
-    .globe-host .glyph-output {
+    canvas { display: block; width: 100%; height: 100%; cursor: grab; }
+    canvas:active { cursor: grabbing; }
+    .blog-button, .rotation-button {
+      position: absolute;
+      right: 24px;
+      bottom: 24px;
+      z-index: 10;
+      border: 1px solid rgba(255, 232, 184, 0.55);
+      border-radius: 4px;
+      padding: 9px 13px;
+      background: rgba(3, 5, 10, 0.82);
       color: rgba(255, 232, 184, 0.96);
-      text-shadow: 0 0 6px rgba(255, 200, 130, 0.35);
-      cursor: grab;
-      touch-action: none;
-      will-change: transform;
-      backface-visibility: hidden;
+      font: inherit;
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      cursor: pointer;
+      text-decoration: none;
     }
-
-    .globe-host .glyph-output:active {
-      cursor: grabbing;
-    }
-
+    .rotation-button { left: 24px; right: auto; }
+    .blog-button:hover, .rotation-button:hover { background: rgba(255, 232, 184, 0.12); }
+    .blog-button:focus-visible, .rotation-button:focus-visible { outline: 2px solid #ffe8b8; outline-offset: 3px; }
     .loading {
       position: absolute;
       inset: 0;
@@ -86,374 +56,602 @@ const description = "ETOPO1 global topography rasterised into ASCII. Isometric, 
       justify-content: center;
       color: rgba(255, 232, 184, 0.4);
       font-size: 13px;
+      pointer-events: none;
     }
   </style>
 </head>
-
 <body>
-  <div class="ex-layout">
-    <div class="ex-main">
-      <div class="map-shell">
-        <div class="map-stage">
-          <div class="globe-host" id="globe-host">
-            <div class="loading" id="loading">Loading topography data…</div>
-          </div>
-        </div>
-      </div>
-    </div>
+  <div class="globe-host" id="globe-host">
+    <canvas id="globe" role="img" aria-label="ASCII Earth rotating around its polar axis. Drag to rotate and scroll to zoom."></canvas>
+    <button class="rotation-button" id="rotation-button" type="button" hidden>Pause rotation</button>
+    <a class="blog-button" id="blog-button" href={blogUrl}>Open blog</a>
+    <div class="loading" id="loading" role="status">Loading topography data…</div>
   </div>
-
   <script>
-    import {
-      createGlyphScene,
-      createGlyphOrthographicCamera,
-    } from "glyphcss";
-
-    type Polygon = { vertices: [number, number, number][]; color?: string };
-    type MeshHandle = { dispose(): void; setTransform(t: unknown): void };
-    type Manifest = {
-      zooms: Array<{ z: number; cols: number; rows: number; tileLonSpan: number; tileLatSpan: number }>;
-      heightExagg: number;
-      earthRadiusM: number;
-    };
+    type Vec3 = [number, number, number];
+    type Polygon = { vertices: Vec3[]; color?: string };
+    type Manifest = { zooms: Array<{ z: number; cols: number; rows: number }> };
+    type Terrain = { vertices: Float32Array; radius: number };
+    type Mesh = { buffer: WebGLBuffer; vao: WebGLVertexArrayObject; count: number };
+    type Label = { name: string; lat: number; lon: number };
+    type Grid = { width: number; height: number; cellWidth: number; cellHeight: number; cols: number; rows: number; dpr: number };
 
     const INITIAL_ZOOM = 300;
+    const DETAIL_ZOOM = 450;
+    const AUTO_ROTATE_DEGREES_PER_SECOND = 3;
+    const AUTO_ROTATE_FRAME_INTERVAL = 1000 / 30;
+    const LIGHT_INTERVAL = 15 * 60 * 1000;
+    const FONT_SIZE = 13;
+    const GLYPHS = " .:-=+*#%@";
+    const BASE_LIGHT: Vec3 = [0.5, 0.7, 0.5];
 
     function compactRotation(degrees: number): number {
-      const normalized = ((degrees + 180) % 360 + 360) % 360 - 180;
-      return Object.is(normalized, -0) ? 0 : normalized;
+      return ((degrees + 180) % 360 + 360) % 360 - 180;
     }
 
-    function targetLOD(zoom: number): number {
-      if (zoom < 600) return 0;
-      return 1;
+    function latLonToXYZ(lat: number, lon: number): Vec3 {
+      const latitude = lat * Math.PI / 180, longitude = lon * Math.PI / 180;
+      return [Math.cos(latitude) * Math.cos(longitude), -Math.cos(latitude) * Math.sin(longitude), Math.sin(latitude)];
     }
 
-    function latLonToXYZ(latDeg: number, lonDeg: number): [number, number, number] {
-      const lat = (latDeg * Math.PI) / 180;
-      const lon = (lonDeg * Math.PI) / 180;
-      const cosLat = Math.cos(lat);
-      return [cosLat * Math.cos(lon), -cosLat * Math.sin(lon), Math.sin(lat)];
+    function prepareTerrain(polygons: Polygon[]): Terrain {
+      let count = 0;
+      for (const polygon of polygons) count += Math.max(0, polygon.vertices.length - 2) * 3;
+      const vertices = new Float32Array(count * 9);
+      let offset = 0, radius = 1;
+      for (const polygon of polygons) {
+        const points = polygon.vertices;
+        if (points.length < 3) continue;
+        const first = points[0];
+        let normalX = 0, normalY = 0, normalZ = 0;
+        for (let index = 1; index < points.length - 1; index++) {
+          const second = points[index], third = points[index + 1];
+          const firstX = second[0] - first[0], firstY = second[1] - first[1], firstZ = second[2] - first[2];
+          const secondX = third[0] - first[0], secondY = third[1] - first[1], secondZ = third[2] - first[2];
+          normalX += firstY * secondZ - firstZ * secondY;
+          normalY += firstZ * secondX - firstX * secondZ;
+          normalZ += firstX * secondY - firstY * secondX;
+        }
+        const length = Math.hypot(normalX, normalY, normalZ);
+        const orientation = normalX * first[0] + normalY * first[1] + normalZ * first[2] < 0 ? -1 : 1;
+        const divisor = length > 1e-12 ? length * orientation : 1;
+        const color = Number.parseInt((polygon.color ?? "#cccccc").slice(1), 16);
+        const red = (color >> 16 & 255) / 255, green = (color >> 8 & 255) / 255, blue = (color & 255) / 255;
+        for (let index = 1; index < points.length - 1; index++) {
+          for (const point of [first, points[index], points[index + 1]]) {
+            radius = Math.max(radius, Math.hypot(point[0], point[1], point[2]));
+            vertices[offset++] = point[0]; vertices[offset++] = point[1]; vertices[offset++] = point[2];
+            vertices[offset++] = normalX / divisor; vertices[offset++] = normalY / divisor; vertices[offset++] = normalZ / divisor;
+            vertices[offset++] = red; vertices[offset++] = green; vertices[offset++] = blue;
+          }
+        }
+      }
+      return { vertices, radius };
+    }
+
+    function createRenderer(canvas: HTMLCanvasElement) {
+      const context = canvas.getContext("webgl2", { alpha: false, antialias: false, depth: false, stencil: false, preserveDrawingBuffer: false });
+      if (!context) throw new Error("WebGL2 is unavailable. Use the Open blog button to continue.");
+      const gl = context;
+      const programs: WebGLProgram[] = [], textures: WebGLTexture[] = [], meshes: Mesh[] = [];
+      function program(vertexSource: string, fragmentSource: string): WebGLProgram {
+        const compiled = gl.createProgram();
+        if (!compiled) throw new Error("Unable to create GPU program.");
+        const shaders: WebGLShader[] = [];
+        try {
+          for (const [shaderType, source] of [[gl.VERTEX_SHADER, vertexSource], [gl.FRAGMENT_SHADER, fragmentSource]] as const) {
+            const shader = gl.createShader(shaderType);
+            if (!shader) throw new Error("Unable to create GPU shader.");
+            shaders.push(shader);
+            gl.shaderSource(shader, source);
+            gl.compileShader(shader);
+            if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(shader) ?? "GPU shader compilation failed.");
+            gl.attachShader(compiled, shader);
+          }
+          gl.linkProgram(compiled);
+          if (!gl.getProgramParameter(compiled, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(compiled) ?? "GPU program linking failed.");
+        } catch (error) {
+          gl.deleteProgram(compiled);
+          throw error;
+        } finally {
+          for (const shader of shaders) gl.deleteShader(shader);
+        }
+        programs.push(compiled);
+        return compiled;
+      }
+      const terrainProgram = program(`#version 300 es
+        precision highp float;
+        layout(location = 0) in vec3 position;
+        layout(location = 1) in vec3 normal;
+        layout(location = 2) in vec3 color;
+        uniform mat3 view;
+        uniform vec2 viewport, cellSize, gridSize;
+        uniform float zoom, radius;
+        flat out vec3 faceNormal, faceColor;
+        void main() {
+          vec3 point = view * position;
+          vec2 cell = (point.xy * zoom + viewport * 0.5) / cellSize;
+          gl_Position = vec4(cell.x / gridSize.x * 2.0 - 1.0, 1.0 - cell.y / gridSize.y * 2.0, point.z / radius, 1.0);
+          faceNormal = normal;
+          faceColor = color;
+        }
+      `, `#version 300 es
+        precision highp float;
+        flat in vec3 faceNormal, faceColor;
+        uniform mat3 view;
+        uniform vec3 light;
+        out vec4 outputColor;
+        void main() {
+          if ((view * faceNormal).z >= 0.0) discard;
+          float shade = clamp(0.45 + 1.1 * max(0.0, dot(-faceNormal, normalize(light))), 0.0, 1.0);
+          float glyph = round(shade * 9.0);
+          outputColor = vec4(faceColor * shade, (glyph + 1.0) / 255.0);
+        }
+      `);
+      const glyphProgram = program(`#version 300 es
+        precision highp float;
+        void main() {
+          vec2 position = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+          gl_Position = vec4(position * 2.0 - 1.0, 0.0, 1.0);
+        }
+      `, `#version 300 es
+        precision highp float;
+        uniform sampler2D terrain, atlas;
+        uniform vec2 viewport, cellSize, atlasCell;
+        uniform ivec2 gridSize;
+        uniform float dpr;
+        out vec4 outputColor;
+        void main() {
+          vec2 pixel = vec2(gl_FragCoord.x, viewport.y * dpr - gl_FragCoord.y) / dpr;
+          ivec2 cell = ivec2(floor(pixel / cellSize));
+          vec3 background = vec3(3.0, 5.0, 10.0) / 255.0;
+          if (any(greaterThanEqual(cell, gridSize))) {outputColor = vec4(background, 1.0); return;}
+          vec4 sampleColor = texelFetch(terrain, ivec2(cell.x, gridSize.y - 1 - cell.y), 0);
+          if (sampleColor.a == 0.0) {outputColor = vec4(background, 1.0); return;}
+          float glyph = round(sampleColor.a * 255.0) - 1.0;
+          vec2 withinCell = mod(pixel, cellSize) * dpr + vec2(2.0);
+          vec2 uv = vec2((glyph * atlasCell.x + withinCell.x) / (atlasCell.x * 10.0), withinCell.y / atlasCell.y);
+          float coverage = texture(atlas, uv).a;
+          outputColor = vec4(mix(background, sampleColor.rgb, coverage), 1.0);
+        }
+      `);
+      function uniforms(compiled: WebGLProgram, names: string[]) {
+        return Object.fromEntries(names.map((name) => [name, gl.getUniformLocation(compiled, name)]));
+      }
+      const terrainUniforms = uniforms(terrainProgram, ["view", "viewport", "cellSize", "gridSize", "zoom", "radius", "light"]);
+      const glyphUniforms = uniforms(glyphProgram, ["terrain", "atlas", "viewport", "cellSize", "gridSize", "atlasCell", "dpr"]);
+      function texture(): WebGLTexture {
+        const result = gl.createTexture();
+        if (!result) throw new Error("Unable to create GPU texture.");
+        textures.push(result);
+        gl.bindTexture(gl.TEXTURE_2D, result);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        return result;
+      }
+      const terrainTexture = texture(), atlasTexture = texture();
+      const framebuffer = gl.createFramebuffer(), depthBuffer = gl.createRenderbuffer(), fullscreen = gl.createVertexArray();
+      if (!framebuffer || !depthBuffer || !fullscreen) throw new Error("Unable to allocate GPU render targets.");
+      let atlasCell: [number, number] = [1, 1];
+      return {
+        upload(terrain: Terrain): Mesh {
+          const buffer = gl.createBuffer(), vao = gl.createVertexArray();
+          if (!buffer || !vao) throw new Error("Unable to allocate GPU terrain.");
+          gl.bindVertexArray(vao);
+          gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+          gl.bufferData(gl.ARRAY_BUFFER, terrain.vertices, gl.STATIC_DRAW);
+          for (let attribute = 0; attribute < 3; attribute++) {
+            gl.enableVertexAttribArray(attribute);
+            gl.vertexAttribPointer(attribute, 3, gl.FLOAT, false, 36, attribute * 12);
+          }
+          const mesh = { buffer, vao, count: terrain.vertices.length / 9 };
+          meshes.push(mesh);
+          return mesh;
+        },
+        resize(grid: Grid) {
+          canvas.width = Math.round(grid.width * grid.dpr);
+          canvas.height = Math.round(grid.height * grid.dpr);
+          gl.activeTexture(gl.TEXTURE0);
+          gl.bindTexture(gl.TEXTURE_2D, terrainTexture);
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, grid.cols, grid.rows, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+          gl.bindRenderbuffer(gl.RENDERBUFFER, depthBuffer);
+          gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, grid.cols, grid.rows);
+          gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+          gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, terrainTexture, 0);
+          gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depthBuffer);
+          if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) throw new Error("GPU framebuffer is incomplete.");
+          const atlas = document.createElement("canvas");
+          atlasCell = [Math.ceil(grid.cellWidth * grid.dpr) + 4, Math.ceil(grid.cellHeight * grid.dpr) + 4];
+          atlas.width = atlasCell[0] * GLYPHS.length;
+          atlas.height = atlasCell[1];
+          const painter = atlas.getContext("2d");
+          if (!painter) throw new Error("Unable to create character atlas.");
+          painter.font = `${FONT_SIZE * grid.dpr}px monospace`;
+          painter.fillStyle = "white";
+          const metrics = painter.measureText("M");
+          const ascent = metrics.fontBoundingBoxAscent ?? metrics.actualBoundingBoxAscent ?? FONT_SIZE * grid.dpr * 0.8;
+          const descent = metrics.fontBoundingBoxDescent ?? metrics.actualBoundingBoxDescent ?? FONT_SIZE * grid.dpr * 0.2;
+          const baseline = (grid.cellHeight * grid.dpr - ascent - descent) / 2 + ascent;
+          for (let index = 0; index < GLYPHS.length; index++) painter.fillText(GLYPHS[index], index * atlasCell[0] + 2, baseline + 2);
+          gl.activeTexture(gl.TEXTURE1);
+          gl.bindTexture(gl.TEXTURE_2D, atlasTexture);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+          gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, atlas);
+          gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        },
+        render(mesh: Mesh, grid: Grid, view: Float32Array, zoom: number, radius: number, light: Vec3) {
+          gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+          gl.viewport(0, 0, grid.cols, grid.rows);
+          gl.enable(gl.DEPTH_TEST);
+          gl.depthFunc(gl.LESS);
+          gl.disable(gl.BLEND);
+          gl.disable(gl.DITHER);
+          gl.clearColor(0, 0, 0, 0);
+          gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+          gl.useProgram(terrainProgram);
+          gl.uniformMatrix3fv(terrainUniforms.view, false, view);
+          gl.uniform2f(terrainUniforms.viewport, grid.width, grid.height);
+          gl.uniform2f(terrainUniforms.cellSize, grid.cellWidth, grid.cellHeight);
+          gl.uniform2f(terrainUniforms.gridSize, grid.cols, grid.rows);
+          gl.uniform1f(terrainUniforms.zoom, zoom);
+          gl.uniform1f(terrainUniforms.radius, radius + 0.01);
+          gl.uniform3fv(terrainUniforms.light, light);
+          gl.bindVertexArray(mesh.vao);
+          gl.drawArrays(gl.TRIANGLES, 0, mesh.count);
+          gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+          gl.viewport(0, 0, canvas.width, canvas.height);
+          gl.disable(gl.DEPTH_TEST);
+          gl.useProgram(glyphProgram);
+          gl.activeTexture(gl.TEXTURE0);
+          gl.bindTexture(gl.TEXTURE_2D, terrainTexture);
+          gl.activeTexture(gl.TEXTURE1);
+          gl.bindTexture(gl.TEXTURE_2D, atlasTexture);
+          gl.uniform1i(glyphUniforms.terrain, 0);
+          gl.uniform1i(glyphUniforms.atlas, 1);
+          gl.uniform2f(glyphUniforms.viewport, grid.width, grid.height);
+          gl.uniform2f(glyphUniforms.cellSize, grid.cellWidth, grid.cellHeight);
+          gl.uniform2i(glyphUniforms.gridSize, grid.cols, grid.rows);
+          gl.uniform2f(glyphUniforms.atlasCell, atlasCell[0], atlasCell[1]);
+          gl.uniform1f(glyphUniforms.dpr, grid.dpr);
+          gl.bindVertexArray(fullscreen);
+          gl.drawArrays(gl.TRIANGLES, 0, 3);
+        },
+        dispose() {
+          for (const mesh of meshes) {gl.deleteBuffer(mesh.buffer); gl.deleteVertexArray(mesh.vao);}
+          for (const compiled of programs) gl.deleteProgram(compiled);
+          for (const ownedTexture of textures) gl.deleteTexture(ownedTexture);
+          gl.deleteFramebuffer(framebuffer); gl.deleteRenderbuffer(depthBuffer); gl.deleteVertexArray(fullscreen);
+        },
+      };
     }
 
     async function mountGlobe() {
-      const host = document.getElementById("globe-host") as HTMLDivElement;
+      const host = document.getElementById("globe-host");
+      const canvas = document.getElementById("globe") as HTMLCanvasElement | null;
+      const rotationButton = document.getElementById("rotation-button") as HTMLButtonElement | null;
       const loading = document.getElementById("loading");
-      if (!host) return;
-
-      const responsiveZoom = window.innerWidth < 800
-        ? Math.max(120, Math.round(window.innerWidth / 2.6))
-        : INITIAL_ZOOM;
-
-      const camera = createGlyphOrthographicCamera({
-        rotX: 55,
-        rotY: 45,
-        zoom: responsiveZoom,
-      });
-
-      const scene = createGlyphScene(host, {
-        camera,
-        autoSize: true,
-        mode: "solid",
-        useColors: true,
-        glyphPalette: "default",
-        directionalLight: { direction: [0.5, 0.7, 0.5], intensity: 1.1 },
-        ambientLight: { intensity: 0.45 },
-      });
-
-      // Fetch manifest from Astro's public directory (mapped to root /)
-      const manifestRes = await fetch("/data/tiles/manifest.json");
-      const manifest = (await manifestRes.json()) as Manifest;
-
-      const tileCache = new Map < string, Polygon[]> ();
-      const activeHandles = new Map < string, MeshHandle> ();
-      let currentLOD: number | null = null;
-      let updateInFlight = false;
-
-      async function loadTile(z: number, x: number, y: number): Promise<Polygon[]> {
-        const key = `${z}/${x}_${y}`;
-        const cached = tileCache.get(key);
-        if (cached) return cached;
-        const res = await fetch(`/data/tiles/${key}.json`);
-        const polys = await res.json();
-        tileCache.set(key, polys);
-        return polys;
-      }
-
-      function findFocalLatLon(): [number, number] {
-        let bestLat = 0, bestLon = 0, bestDepth = Infinity;
-        for (let lat = -80; lat <= 80; lat += 10) {
-          for (let lon = -180; lon < 180; lon += 10) {
-            const [, , depth] = camera.project(latLonToXYZ(lat, lon), 100, 100, 1);
-            if (depth < bestDepth) {
-              bestDepth = depth; bestLat = lat; bestLon = lon;
-            }
-          }
-        }
-        for (let lat = bestLat - 10; lat <= bestLat + 10; lat += 2) {
-          for (let lon = bestLon - 10; lon <= bestLon + 10; lon += 2) {
-            const [, , depth] = camera.project(latLonToXYZ(lat, lon), 100, 100, 1);
-            if (depth < bestDepth) {
-              bestDepth = depth; bestLat = lat; bestLon = lon;
-            }
-          }
-        }
-        return [bestLat, bestLon];
-      }
-
-      function angularDistanceRad(lat1: number, lon1: number, lat2: number, lon2: number): number {
-        const phi1 = (lat1 * Math.PI) / 180;
-        const phi2 = (lat2 * Math.PI) / 180;
-        const dLambda = ((lon2 - lon1) * Math.PI) / 180;
-        const cos = Math.min(
-          1,
-          Math.max(-1, Math.sin(phi1) * Math.sin(phi2) + Math.cos(phi1) * Math.cos(phi2) * Math.cos(dLambda)),
-        );
-        return Math.acos(cos);
-      }
-
-      function isTileVisible(
-        z: number, x: number, y: number,
-        focalLat: number, focalLon: number, radiusRad: number,
-      ): boolean {
-        const def = manifest.zooms.find((zz) => zz.z === z);
-        if (!def) return false;
-        const lonMin = -180 + x * def.tileLonSpan;
-        const lonMax = lonMin + def.tileLonSpan;
-        const latMax = 90 - y * def.tileLatSpan;
-        const latMin = latMax - def.tileLatSpan;
-        for (const lat of [latMin, (latMin + latMax) / 2, latMax]) {
-          for (const lon of [lonMin, (lonMin + lonMax) / 2, lonMax]) {
-            if (angularDistanceRad(focalLat, focalLon, lat, lon) < radiusRad) return true;
-          }
-        }
-        return false;
-      }
-
-      async function updateActiveSet() {
-        if (updateInFlight) return;
-        updateInFlight = true;
-        try {
-          const lod = targetLOD(camera.zoom);
-          const def = manifest.zooms.find((zz) => zz.z === lod);
-          if (!def) return;
-
-          const tileDiagRad =
-            Math.hypot(def.tileLonSpan, def.tileLatSpan) * 0.5 * (Math.PI / 180);
-          const visibleAngularRad = Math.PI / 2 + tileDiagRad;
-
-          const [focalLat, focalLon] = findFocalLatLon();
-
-          const desired = new Set < string > ();
-          for (let y = 0; y < def.rows; y++) {
-            for (let x = 0; x < def.cols; x++) {
-              if (isTileVisible(lod, x, y, focalLat, focalLon, visibleAngularRad)) {
-                desired.add(`${lod}/${x}_${y}`);
-              }
-            }
-          }
-
-          if (desired.size === 0 && def.cols > 0 && def.rows > 0) {
-            desired.add(`${lod}/0_0`);
-          }
-
-          const missing = [...desired].filter((k) => !tileCache.has(k));
-          if (missing.length > 0) {
-            await Promise.all(missing.map((k) => {
-              const [z, xy] = k.split("/");
-              const [x, y] = xy.split("_").map(Number);
-              return loadTile(Number(z), x, y);
-            }));
-          }
-
-          for (const [key, handle] of activeHandles) {
-            if (!desired.has(key)) {
-              handle.dispose();
-              activeHandles.delete(key);
-            }
-          }
-          for (const key of desired) {
-            if (!activeHandles.has(key)) {
-              const polys = tileCache.get(key);
-              if (polys) activeHandles.set(key, scene.add(polys) as unknown as MeshHandle);
-            }
-          }
-
-          currentLOD = lod;
-          scene.rerender();
-        } finally {
-          updateInFlight = false;
-        }
-      }
-
-      let updateTimer: ReturnType<typeof setTimeout> | null = null;
-      function scheduleUpdate(onSettled?: () => void): void {
-        if (updateTimer) clearTimeout(updateTimer);
-        updateTimer = setTimeout(() => {
-          updateTimer = null;
-          void updateActiveSet();
-          onSettled?.();
-        }, 180);
-      }
-
-      await updateActiveSet();
-      loading?.remove();
-
-      // ── Country labels ──────────────────
-      type LabelRec = { name: string; lat: number; lon: number; w: number };
-      const labelEls: HTMLElement[] = [];
-      let labelData: LabelRec[] = [];
-      const LABEL_R = 1.06;
-
-      type ProjectionGrid = {
-        cols: number;
-        rows: number;
-        cellAspect: number;
-        cellWidth: number;
-        cellHeight: number;
-        centerCol: number;
-        centerRow: number;
-      };
-
-      function gridDims() {
-        const o = scene.getOptions();
-        return { cols: o.cols ?? 80, rows: o.rows ?? 24, cellAspect: o.cellAspect ?? 2 };
-      }
-
-      function projectionGrid(): ProjectionGrid {
-        const g = gridDims();
-        const hostRect = host.getBoundingClientRect();
-        const preRect = scene.output.getBoundingClientRect();
-        const cellWidth = preRect.width > 0 ? preRect.width / g.cols
-          : hostRect.width > 0 ? hostRect.width / g.cols
-            : 50 / g.cellAspect;
-        const cellHeight = preRect.height > 0 ? preRect.height / g.rows
-          : hostRect.height > 0 ? hostRect.height / g.rows
-            : 50;
-        return {
-          ...g,
-          cellWidth,
-          cellHeight,
-          centerCol: g.cols * camera.center[0] + (hostRect.width > 0 ? (hostRect.width - g.cols * cellWidth) / (2 * cellWidth) : 0),
-          centerRow: g.rows * camera.center[1] + (hostRect.height > 0 ? (hostRect.height - g.rows * cellHeight) / (2 * cellHeight) : 0),
-        };
-      }
-
-      function updateGlobeLabels(): void {
-        const pg = projectionGrid();
-        const hostRect = host.getBoundingClientRect();
-        const maxShown = Math.max(8, Math.min(labelData.length, Math.round((camera.zoom / INITIAL_ZOOM) * 9)));
-        const placed: Array<{ x: number; y: number; w: number; h: number }> = [];
-        let count = 0;
-        for (let i = 0; i < labelEls.length; i++) {
-          const rec = labelData[i];
-          const u = latLonToXYZ(rec.lat, rec.lon);
-          const [col, row, depth] = camera.project([u[0] * LABEL_R, u[1] * LABEL_R, u[2] * LABEL_R], pg.cols, pg.rows, pg.cellAspect, pg);
-          let show = false;
-          if (count < maxShown && depth < 0 && Number.isFinite(col)) {
-            const px = col * pg.cellWidth, py = row * pg.cellHeight;
-            if (px >= 0 && px <= hostRect.width && py >= 0 && py <= hostRect.height) {
-              const w = rec.name.length * 6 + 6, h = 13;
-              const r = { x: px - w / 2, y: py - h / 2, w, h };
-              if (!placed.some((p) => !(r.x + r.w < p.x || r.x > p.x + p.w || r.y + r.h < p.y || r.y > p.y + p.h))) {
-                placed.push(r); count++; show = true;
-                const el = labelEls[i];
-                el.style.left = `${px}px`; el.style.top = `${py}px`;
-              }
-            }
-          }
-          labelEls[i].style.opacity = show ? "0.92" : "0";
-        }
-      }
-
-      void (async () => {
-        try {
-          const res = await fetch("/data/flatmap/labels.json");
-          labelData = await res.json();
-          for (const rec of labelData) {
-            const el = document.createElement("div");
-            el.textContent = rec.name;
-            el.style.cssText =
-              "position:absolute;transform:translate(-50%,-50%);white-space:nowrap;font-size:10px;" +
-              "letter-spacing:0.08em;text-transform:uppercase;color:rgba(255,245,224,0.96);" +
-              "text-shadow:0 0 3px #000,0 0 6px #000;opacity:0;transition:opacity 140ms ease;" +
-              "pointer-events:none;z-index:5;";
-            host.appendChild(el);
-            labelEls.push(el);
-          }
-          updateGlobeLabels();
-        } catch (e) { console.error("labels load failed", e); }
-      })();
-
-      function pixelsPerUnit(): number {
-        const pg = projectionGrid();
-        const a = camera.project([0, 0, 0], pg.cols, pg.rows, pg.cellAspect, pg);
-        const b = camera.project([0, 0, 1], pg.cols, pg.rows, pg.cellAspect, pg);
-        const dCol = (b[0] - a[0]) * pg.cellWidth;
-        const dRow = (b[1] - a[1]) * pg.cellHeight;
-        return Math.hypot(dCol, dRow) || 1;
-      }
-
+      if (!host || !canvas || !rotationButton) return;
+      const events = new AbortController();
+      const workers = new Set<Worker>();
+      const terrainCache = new Map<number, Promise<Terrain>>();
+      const gpuMeshes = new Map<number, Mesh>();
+      const labels: Array<{ element: HTMLDivElement; point: Vec3; width: number }> = [];
+      const camera = { rotX: 55, rotY: 45, zoom: window.innerWidth < 800 ? Math.max(120, Math.round(window.innerWidth / 2.6)) : INITIAL_ZOOM };
+      let renderer: ReturnType<typeof createRenderer> | null = null;
+      let manifest: Manifest;
+      let grid: Grid | null = null;
+      let activeTerrain: Terrain | null = null;
+      let activeLOD: number | null = null, requestedLOD: number | null = null;
+      let loadVersion = 0;
+      let renderFrame: number | null = null;
+      let viewDirty = true, lastRenderTime = 0;
+      let lastSpinTime: number | null = null;
+      let spinDegrees = 0, resumeSpinAt = performance.now() + 800;
+      const motionPreference = matchMedia("(prefers-reduced-motion: reduce)");
+      let autoRotate = !motionPreference.matches;
+      let disposed = false, contextLost = false;
       let activePtr: number | null = null;
       let lastX = 0, lastY = 0;
-      let viewDirty = false;
-      let renderFrame: number | null = null;
+      let light: Vec3 = [...BASE_LIGHT];
+      const firstLightBucket = Math.floor(Date.now() / LIGHT_INTERVAL);
+      let lightTimer: ReturnType<typeof setTimeout> | null = null;
+      const rotation = new Float32Array(9);
+      const objectLight: Vec3 = [...BASE_LIGHT];
+      let preloadTimer: ReturnType<typeof setTimeout> | null = null;
 
-      function scheduleViewRender(): void {
-        if (renderFrame !== null) return;
-        renderFrame = requestAnimationFrame(() => {
+      function showStatus(message: string) {
+        if (loading) {loading.textContent = message; loading.style.display = "flex";}
+      }
+      function updateRotation() {
+        const pitch = camera.rotX * Math.PI / 180, yaw = (camera.rotY + spinDegrees) * Math.PI / 180;
+        const sinPitch = Math.sin(pitch), cosPitch = Math.cos(pitch), sinYaw = Math.sin(yaw), cosYaw = Math.cos(yaw);
+        rotation.set([-sinYaw, cosPitch * cosYaw, sinPitch * cosYaw, cosYaw, cosPitch * sinYaw, sinPitch * sinYaw, 0, -sinPitch, cosPitch]);
+        const spin = spinDegrees * Math.PI / 180;
+        const cosSpin = Math.cos(spin), sinSpin = Math.sin(spin);
+        objectLight[0] = light[0] * cosSpin - light[1] * sinSpin;
+        objectLight[1] = light[0] * sinSpin + light[1] * cosSpin;
+        objectLight[2] = light[2];
+      }
+      function updateLabels(current: Grid) {
+        const placed: Array<{ x: number; y: number; w: number; h: number }> = [];
+        const maxShown = Math.max(8, Math.min(labels.length, Math.round(camera.zoom / INITIAL_ZOOM * 9)));
+        for (const label of labels) {
+          let show = false;
+          if (placed.length < maxShown) {
+            const [pointX, pointY, pointZ] = label.point;
+            const depth = rotation[2] * pointX + rotation[5] * pointY + rotation[8] * pointZ;
+            const pixelX = (rotation[0] * pointX + rotation[3] * pointY + rotation[6] * pointZ) * camera.zoom + current.width / 2;
+            const pixelY = (rotation[1] * pointX + rotation[4] * pointY + rotation[7] * pointZ) * camera.zoom + current.height / 2;
+            if (depth < 0 && pixelX >= 0 && pixelX <= current.width && pixelY >= 0 && pixelY <= current.height) {
+              const rect = { x: pixelX - label.width / 2, y: pixelY - 6.5, w: label.width, h: 13 };
+              if (!placed.some((other) => !(rect.x + rect.w < other.x || rect.x > other.x + other.w || rect.y + rect.h < other.y || rect.y > other.y + other.h))) {
+                placed.push(rect);
+                show = true;
+                label.element.style.left = `${pixelX}px`;
+                label.element.style.top = `${pixelY}px`;
+              }
+            }
+          }
+          const opacity = show ? "0.92" : "0";
+          if (label.element.style.opacity !== opacity) label.element.style.opacity = opacity;
+        }
+      }
+      function scheduleRender() {
+        viewDirty = true;
+        requestFrame();
+      }
+      function requestFrame() {
+        if (renderFrame !== null || disposed || contextLost || document.hidden) return;
+        renderFrame = requestAnimationFrame((timestamp) => {
           renderFrame = null;
-          scene.rerender();
-          updateGlobeLabels();
+          if (!renderer || !grid || !activeTerrain || activeLOD === null || disposed || contextLost || document.hidden) return;
+          const mesh = gpuMeshes.get(activeLOD);
+          if (!mesh) return;
+          const spinning = autoRotate && activePtr === null && timestamp >= resumeSpinAt;
+          if (spinning && lastSpinTime !== null) spinDegrees = compactRotation(spinDegrees + (timestamp - lastSpinTime) * AUTO_ROTATE_DEGREES_PER_SECOND / 1000);
+          lastSpinTime = spinning ? timestamp : null;
+          if (viewDirty || spinning && timestamp - lastRenderTime >= AUTO_ROTATE_FRAME_INTERVAL) {
+            updateRotation();
+            renderer.render(mesh, grid, rotation, camera.zoom, activeTerrain.radius, objectLight);
+            updateLabels(grid);
+            viewDirty = false;
+            lastRenderTime = timestamp;
+            if (loading) loading.style.display = "none";
+          }
+          if (autoRotate) requestFrame();
         });
       }
-
-      host.addEventListener("pointerdown", (e) => {
-        if (activePtr !== null) return;
-        activePtr = e.pointerId;
-        lastX = e.clientX;
-        lastY = e.clientY;
-        host.setPointerCapture(e.pointerId);
-      });
-
-      host.addEventListener("pointermove", (e) => {
-        if (activePtr !== e.pointerId) return;
-        const dx = e.clientX - lastX;
-        const dy = e.clientY - lastY;
-        lastX = e.clientX;
-        lastY = e.clientY;
-
-        const degPerPx = (1 / pixelsPerUnit()) * (180 / Math.PI);
-        camera.rotY += dx * degPerPx;
-        camera.rotX += dy * degPerPx;
-        viewDirty = true;
-        scheduleViewRender();
-      });
-
-      const release = (e: PointerEvent) => {
-        if (activePtr !== e.pointerId) return;
-        activePtr = null;
-        try { host.releasePointerCapture(e.pointerId); } catch { }
-        if (viewDirty) {
-          viewDirty = false;
-          scheduleUpdate();
+      function setAutoRotation(enabled: boolean) {
+        autoRotate = enabled;
+        lastSpinTime = null;
+        rotationButton!.hidden = false;
+        rotationButton!.textContent = enabled ? "Pause rotation" : "Resume rotation";
+        scheduleRender();
+      }
+      function resize() {
+        if (!renderer || disposed || contextLost) return;
+        const measure = document.createElement("canvas").getContext("2d");
+        if (!measure) return;
+        measure.font = `${FONT_SIZE}px monospace`;
+        const width = host!.clientWidth, height = host!.clientHeight;
+        if (width <= 0 || height <= 0) return;
+        const cellWidth = measure.measureText("M").width;
+        const next = { width, height, cellWidth, cellHeight: FONT_SIZE, cols: Math.max(1, Math.floor(width / cellWidth)), rows: Math.max(1, Math.floor(height / FONT_SIZE)), dpr: window.devicePixelRatio || 1 };
+        if (grid && Object.keys(next).every((key) => next[key as keyof Grid] === grid![key as keyof Grid])) return;
+        grid = next;
+        renderer.resize(grid);
+        scheduleRender();
+      }
+      async function fetchJSON<Result>(url: string): Promise<Result> {
+        const response = await fetch(url, { signal: events.signal });
+        if (!response.ok) throw new Error(`Unable to load ${url}: ${response.status}`);
+        return response.json() as Promise<Result>;
+      }
+      async function loadTerrain(urls: string[]): Promise<Terrain> {
+        if (typeof Worker !== "undefined") {
+          const source = `const prepareTerrain = ${prepareTerrain.toString()};
+            self.onmessage = async ({ data: urls }) => {
+              try {
+                const tiles = await Promise.all(urls.map(async (url) => {
+                  const response = await fetch(url);
+                  if (!response.ok) throw new Error('Unable to load terrain: ' + response.status);
+                  return prepareTerrain(await response.json());
+                }));
+                const vertices = new Float32Array(tiles.reduce((length, tile) => length + tile.vertices.length, 0));
+                let offset = 0, radius = 1;
+                for (const tile of tiles) {vertices.set(tile.vertices, offset); offset += tile.vertices.length; radius = Math.max(radius, tile.radius);}
+                self.postMessage({ vertices, radius }, [vertices.buffer]);
+              } catch (error) {self.postMessage({ error: String(error) });}
+            };`;
+          const objectUrl = URL.createObjectURL(new Blob([source], { type: "text/javascript" }));
+          try {
+            return await new Promise<Terrain>((resolve, reject) => {
+              const worker = new Worker(objectUrl);
+              workers.add(worker);
+              const release = () => {worker.terminate(); workers.delete(worker); events.signal.removeEventListener("abort", abort);};
+              const abort = () => {release(); reject(new DOMException("Aborted", "AbortError"));};
+              events.signal.addEventListener("abort", abort, { once: true });
+              worker.onmessage = ({ data }) => {release(); data.error ? reject(new Error(data.error)) : resolve(data as Terrain);};
+              worker.onerror = () => {release(); reject(new Error("Terrain worker failed."));};
+              worker.postMessage(urls);
+            });
+          } catch (error) {
+            if (disposed || events.signal.aborted) throw error;
+            console.warn("Terrain worker unavailable; preparing geometry on the main thread.", error);
+          } finally {URL.revokeObjectURL(objectUrl);}
         }
-      };
-
-      host.addEventListener("pointerup", release);
-      host.addEventListener("pointercancel", release);
-
-      host.addEventListener("wheel", (e) => {
-        e.preventDefault();
-        const delta = e.deltaY * 0.001;
-        camera.zoom = Math.max(80, Math.min(1800, camera.zoom * (1 - delta)));
-        scheduleViewRender();
-        scheduleUpdate();
-      }, { passive: false });
+        const tiles = await Promise.all(urls.map((url) => fetchJSON<Polygon[]>(url)));
+        const parts: Terrain[] = [];
+        for (const polygons of tiles) {
+          for (let offset = 0; offset < polygons.length; offset += 1024) {
+            parts.push(prepareTerrain(polygons.slice(offset, offset + 1024)));
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            if (disposed) throw new DOMException("Aborted", "AbortError");
+          }
+        }
+        const vertices = new Float32Array(parts.reduce((length, part) => length + part.vertices.length, 0));
+        let offset = 0, radius = 1;
+        for (const part of parts) {vertices.set(part.vertices, offset); offset += part.vertices.length; radius = Math.max(radius, part.radius);}
+        return { vertices, radius };
+      }
+      function getTerrain(lod: number): Promise<Terrain> {
+        const level = manifest.zooms.find((entry) => entry.z === lod);
+        if (!level) return Promise.reject(new Error(`Missing terrain detail level ${lod}.`));
+        let pending = terrainCache.get(lod);
+        if (!pending) {
+          const urls: string[] = [];
+          for (let row = 0; row < level.rows; row++) for (let col = 0; col < level.cols; col++) urls.push(new URL(`${import.meta.env.BASE_URL}data/tiles/${lod}/${col}_${row}.json`, location.href).href);
+          pending = loadTerrain(urls);
+          terrainCache.set(lod, pending);
+          pending.catch(() => terrainCache.delete(lod));
+        }
+        return pending;
+      }
+      async function updateLOD() {
+        if (!manifest || disposed) return;
+        const lod = camera.zoom < DETAIL_ZOOM ? 0 : 1;
+        if (requestedLOD === lod) return;
+        const version = ++loadVersion;
+        requestedLOD = lod;
+        try {
+          const terrain = await getTerrain(lod);
+          if (disposed || contextLost || version !== loadVersion || !renderer) return;
+          if (!gpuMeshes.has(lod)) gpuMeshes.set(lod, renderer.upload(terrain));
+          activeTerrain = terrain;
+          activeLOD = lod;
+          scheduleRender();
+        } catch (error) {
+          if (disposed || version !== loadVersion) return;
+          requestedLOD = null;
+          if (!activeTerrain) showStatus("Unable to load topography. Use the Open blog button to continue.");
+          console.error("Terrain load failed", error);
+        }
+      }
+      function updateLight() {
+        if (disposed) return;
+        const bucket = Math.floor(Date.now() / LIGHT_INTERVAL);
+        const angle = (bucket - firstLightBucket) * LIGHT_INTERVAL / 86400000 * Math.PI * 2;
+        light = [BASE_LIGHT[0] * Math.cos(angle) - BASE_LIGHT[1] * Math.sin(angle), BASE_LIGHT[0] * Math.sin(angle) + BASE_LIGHT[1] * Math.cos(angle), BASE_LIGHT[2]];
+        canvas!.dataset.lightUpdated = String(bucket * LIGHT_INTERVAL);
+        if (lightTimer !== null) clearTimeout(lightTimer);
+        lightTimer = setTimeout(updateLight, LIGHT_INTERVAL - Date.now() % LIGHT_INTERVAL);
+        scheduleRender();
+      }
+      const observer = new ResizeObserver(resize);
+      function dispose() {
+        if (disposed) return;
+        disposed = true;
+        events.abort();
+        observer.disconnect();
+        if (renderFrame !== null) cancelAnimationFrame(renderFrame);
+        if (lightTimer !== null) clearTimeout(lightTimer);
+        if (preloadTimer !== null) clearTimeout(preloadTimer);
+        for (const worker of workers) worker.terminate();
+        renderer?.dispose();
+      }
+      window.addEventListener("pagehide", (event) => {if (!event.persisted) dispose();}, { signal: events.signal });
+      document.addEventListener("astro:before-swap", dispose, { once: true, signal: events.signal });
+      canvas.addEventListener("webglcontextlost", (event) => {
+        event.preventDefault();
+        contextLost = true;
+        lastSpinTime = null;
+        if (renderFrame !== null) {cancelAnimationFrame(renderFrame); renderFrame = null;}
+        showStatus("Restoring GPU renderer…");
+      }, { signal: events.signal });
+      canvas.addEventListener("webglcontextrestored", () => {
+        try {
+          renderer?.dispose();
+          renderer = createRenderer(canvas);
+          contextLost = false;
+          gpuMeshes.clear();
+          activeLOD = requestedLOD = null;
+          activeTerrain = null;
+          grid = null;
+          resize();
+          void updateLOD();
+        } catch (error) {showStatus("Unable to restore GPU renderer. Use the Open blog button to continue."); console.error(error);}
+      }, { signal: events.signal });
+      try {
+        renderer = createRenderer(canvas);
+        resize();
+        observer.observe(host);
+        window.addEventListener("resize", resize, { signal: events.signal });
+        document.addEventListener("visibilitychange", () => {
+          if (document.hidden) {if (renderFrame !== null) cancelAnimationFrame(renderFrame); renderFrame = null; lastSpinTime = null;}
+          else {resize(); updateLight(); scheduleRender();}
+        }, { signal: events.signal });
+        updateLight();
+        setAutoRotation(autoRotate);
+        motionPreference.addEventListener("change", () => setAutoRotation(!motionPreference.matches), { signal: events.signal });
+        rotationButton.addEventListener("click", () => setAutoRotation(!autoRotate), { signal: events.signal });
+        canvas.addEventListener("pointerdown", (event) => {
+          if (event.button !== 0 || activePtr !== null) return;
+          activePtr = event.pointerId;
+          lastX = event.clientX;
+          lastY = event.clientY;
+          lastSpinTime = null;
+          canvas.setPointerCapture(event.pointerId);
+        }, { signal: events.signal });
+        canvas.addEventListener("pointermove", (event) => {
+          if (activePtr !== event.pointerId || !grid) return;
+          const degrees = 180 / Math.PI / Math.max(1, camera.zoom * Math.abs(Math.sin(camera.rotX * Math.PI / 180)));
+          camera.rotY = compactRotation(camera.rotY + (event.clientX - lastX) * degrees);
+          camera.rotX = compactRotation(camera.rotX + (event.clientY - lastY) * degrees);
+          lastX = event.clientX; lastY = event.clientY;
+          scheduleRender();
+        }, { signal: events.signal });
+        const release = (event: PointerEvent) => {
+          if (activePtr !== event.pointerId) return;
+          activePtr = null;
+          lastSpinTime = null;
+          resumeSpinAt = performance.now() + 2000;
+          if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+          scheduleRender();
+        };
+        canvas.addEventListener("pointerup", release, { signal: events.signal });
+        canvas.addEventListener("pointercancel", release, { signal: events.signal });
+        canvas.addEventListener("lostpointercapture", release, { signal: events.signal });
+        canvas.addEventListener("wheel", (event) => {
+          event.preventDefault();
+          camera.zoom = Math.max(80, Math.min(1800, camera.zoom * (1 - event.deltaY * 0.001)));
+          scheduleRender();
+          void updateLOD();
+        }, { passive: false, signal: events.signal });
+        void fetchJSON<Label[]>(`${import.meta.env.BASE_URL}data/flatmap/labels.json`).then((records) => {
+          if (disposed) return;
+          const fragment = document.createDocumentFragment();
+          for (const record of records) {
+            const element = document.createElement("div");
+            element.textContent = record.name;
+            element.style.cssText = "position:absolute;transform:translate(-50%,-50%);white-space:nowrap;font-size:10px;letter-spacing:0.08em;text-transform:uppercase;color:rgba(255,245,224,0.96);text-shadow:0 0 3px #000,0 0 6px #000;opacity:0;transition:opacity 140ms ease;pointer-events:none;z-index:5;";
+            const point = latLonToXYZ(record.lat, record.lon).map((value) => value * 1.06) as Vec3;
+            labels.push({ element, point, width: record.name.length * 6 + 6 });
+            fragment.appendChild(element);
+          }
+          host.appendChild(fragment);
+          scheduleRender();
+        }).catch((error) => {if (!disposed) console.error("Labels load failed", error);});
+        manifest = await fetchJSON<Manifest>(`${import.meta.env.BASE_URL}data/tiles/manifest.json`);
+        await updateLOD();
+        if (!disposed && manifest.zooms.some((level) => level.z === 1)) {
+          preloadTimer = setTimeout(() => {
+            preloadTimer = null;
+            void getTerrain(1).then((terrain) => {
+              if (!disposed && !contextLost && renderer && !gpuMeshes.has(1)) gpuMeshes.set(1, renderer.upload(terrain));
+            }).catch((error) => {if (!disposed) console.warn("High-detail terrain preload failed", error);});
+          }, 500);
+        }
+      } catch (error) {
+        showStatus(error instanceof Error ? error.message : "Unable to start GPU renderer.");
+        console.error(error);
+        dispose();
+      }
     }
-
     void mountGlobe();
   </script>
 </body>
-
 </html>
