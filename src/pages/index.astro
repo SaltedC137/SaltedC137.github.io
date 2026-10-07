@@ -1,5 +1,5 @@
 ---
-const title = "ASCII Earth";
+const title = "Welcome to Earth";
 const description = "ETOPO1 global topography rasterised into ASCII. Isometric, drag to orbit.";
 const blogUrl = `${import.meta.env.BASE_URL}blog/`;
 ---
@@ -82,11 +82,19 @@ const blogUrl = `${import.meta.env.BASE_URL}blog/`;
     const AUTO_ROTATE_FRAME_INTERVAL = 1000 / 30;
     const LIGHT_INTERVAL = 15 * 60 * 1000;
     const FONT_SIZE = 13;
+    const COVERAGE_SAMPLES = 3;
     const GLYPHS = " .:-=+*#%@";
     const BASE_LIGHT: Vec3 = [0.5, 0.7, 0.5];
 
     function compactRotation(degrees: number): number {
       return ((degrees + 180) % 360 + 360) % 360 - 180;
+    }
+
+    function targetLOD(levels: Manifest["zooms"], zoom: number): number {
+      const sorted = [...levels].sort((first, second) => first.z - second.z);
+      if (!sorted.length) throw new Error("No terrain detail levels are available.");
+      const index = zoom < DETAIL_ZOOM ? 0 : Math.min(sorted.length - 1, 1 + Math.floor(Math.log2(zoom / DETAIL_ZOOM)));
+      return sorted[index].z;
     }
 
     function latLonToXYZ(lat: number, lon: number): Vec3 {
@@ -184,17 +192,40 @@ const blogUrl = `${import.meta.env.BASE_URL}blog/`;
         void main() {
           if ((view * faceNormal).z >= 0.0) discard;
           float shade = clamp(0.45 + 1.1 * max(0.0, dot(-faceNormal, normalize(light))), 0.0, 1.0);
-          float glyph = round(shade * 9.0);
-          outputColor = vec4(faceColor * shade, (glyph + 1.0) / 255.0);
+          outputColor = vec4(faceColor * shade, (round(shade * 254.0) + 1.0) / 255.0);
         }
       `);
-      const glyphProgram = program(`#version 300 es
+      const fullscreenVertex = `#version 300 es
         precision highp float;
         void main() {
           vec2 position = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
           gl_Position = vec4(position * 2.0 - 1.0, 0.0, 1.0);
         }
-      `, `#version 300 es
+      `;
+      const resolveProgram = program(fullscreenVertex, `#version 300 es
+        precision highp float;
+        uniform sampler2D coverage;
+        out vec4 outputColor;
+        void main() {
+          ivec2 origin = ivec2(gl_FragCoord.xy) * ${COVERAGE_SAMPLES};
+          vec3 color = vec3(0.0);
+          float shade = 0.0, count = 0.0;
+          for (int row = 0; row < ${COVERAGE_SAMPLES}; row++) {
+            for (int col = 0; col < ${COVERAGE_SAMPLES}; col++) {
+              vec4 sampleColor = texelFetch(coverage, origin + ivec2(col, row), 0);
+              if (sampleColor.a > 0.0) {
+                color += sampleColor.rgb;
+                shade += (sampleColor.a * 255.0 - 1.0) / 254.0;
+                count += 1.0;
+              }
+            }
+          }
+          if (count == 0.0) {outputColor = vec4(0.0); return;}
+          float glyph = round(shade / count * 9.0);
+          outputColor = vec4(color / count, (glyph + 1.0) / 255.0);
+        }
+      `);
+      const glyphProgram = program(fullscreenVertex, `#version 300 es
         precision highp float;
         uniform sampler2D terrain, atlas;
         uniform vec2 viewport, cellSize, atlasCell;
@@ -219,6 +250,7 @@ const blogUrl = `${import.meta.env.BASE_URL}blog/`;
         return Object.fromEntries(names.map((name) => [name, gl.getUniformLocation(compiled, name)]));
       }
       const terrainUniforms = uniforms(terrainProgram, ["view", "viewport", "cellSize", "gridSize", "zoom", "radius", "light"]);
+      const resolveUniforms = uniforms(resolveProgram, ["coverage"]);
       const glyphUniforms = uniforms(glyphProgram, ["terrain", "atlas", "viewport", "cellSize", "gridSize", "atlasCell", "dpr"]);
       function texture(): WebGLTexture {
         const result = gl.createTexture();
@@ -231,9 +263,9 @@ const blogUrl = `${import.meta.env.BASE_URL}blog/`;
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
         return result;
       }
-      const terrainTexture = texture(), atlasTexture = texture();
-      const framebuffer = gl.createFramebuffer(), depthBuffer = gl.createRenderbuffer(), fullscreen = gl.createVertexArray();
-      if (!framebuffer || !depthBuffer || !fullscreen) throw new Error("Unable to allocate GPU render targets.");
+      const coverageTexture = texture(), terrainTexture = texture(), atlasTexture = texture();
+      const coverageFramebuffer = gl.createFramebuffer(), framebuffer = gl.createFramebuffer(), depthBuffer = gl.createRenderbuffer(), fullscreen = gl.createVertexArray();
+      if (!coverageFramebuffer || !framebuffer || !depthBuffer || !fullscreen) throw new Error("Unable to allocate GPU render targets.");
       let atlasCell: [number, number] = [1, 1];
       return {
         upload(terrain: Terrain): Mesh {
@@ -254,13 +286,18 @@ const blogUrl = `${import.meta.env.BASE_URL}blog/`;
           canvas.width = Math.round(grid.width * grid.dpr);
           canvas.height = Math.round(grid.height * grid.dpr);
           gl.activeTexture(gl.TEXTURE0);
+          gl.bindTexture(gl.TEXTURE_2D, coverageTexture);
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, grid.cols * COVERAGE_SAMPLES, grid.rows * COVERAGE_SAMPLES, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+          gl.bindRenderbuffer(gl.RENDERBUFFER, depthBuffer);
+          gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, grid.cols * COVERAGE_SAMPLES, grid.rows * COVERAGE_SAMPLES);
+          gl.bindFramebuffer(gl.FRAMEBUFFER, coverageFramebuffer);
+          gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, coverageTexture, 0);
+          gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depthBuffer);
+          if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) throw new Error("GPU coverage framebuffer is incomplete.");
           gl.bindTexture(gl.TEXTURE_2D, terrainTexture);
           gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, grid.cols, grid.rows, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
-          gl.bindRenderbuffer(gl.RENDERBUFFER, depthBuffer);
-          gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, grid.cols, grid.rows);
           gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
           gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, terrainTexture, 0);
-          gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depthBuffer);
           if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) throw new Error("GPU framebuffer is incomplete.");
           const atlas = document.createElement("canvas");
           atlasCell = [Math.ceil(grid.cellWidth * grid.dpr) + 4, Math.ceil(grid.cellHeight * grid.dpr) + 4];
@@ -284,8 +321,8 @@ const blogUrl = `${import.meta.env.BASE_URL}blog/`;
           gl.bindFramebuffer(gl.FRAMEBUFFER, null);
         },
         render(mesh: Mesh, grid: Grid, view: Float32Array, zoom: number, radius: number, light: Vec3) {
-          gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
-          gl.viewport(0, 0, grid.cols, grid.rows);
+          gl.bindFramebuffer(gl.FRAMEBUFFER, coverageFramebuffer);
+          gl.viewport(0, 0, grid.cols * COVERAGE_SAMPLES, grid.rows * COVERAGE_SAMPLES);
           gl.enable(gl.DEPTH_TEST);
           gl.depthFunc(gl.LESS);
           gl.disable(gl.BLEND);
@@ -302,6 +339,15 @@ const blogUrl = `${import.meta.env.BASE_URL}blog/`;
           gl.uniform3fv(terrainUniforms.light, light);
           gl.bindVertexArray(mesh.vao);
           gl.drawArrays(gl.TRIANGLES, 0, mesh.count);
+          gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+          gl.viewport(0, 0, grid.cols, grid.rows);
+          gl.disable(gl.DEPTH_TEST);
+          gl.useProgram(resolveProgram);
+          gl.activeTexture(gl.TEXTURE0);
+          gl.bindTexture(gl.TEXTURE_2D, coverageTexture);
+          gl.uniform1i(resolveUniforms.coverage, 0);
+          gl.bindVertexArray(fullscreen);
+          gl.drawArrays(gl.TRIANGLES, 0, 3);
           gl.bindFramebuffer(gl.FRAMEBUFFER, null);
           gl.viewport(0, 0, canvas.width, canvas.height);
           gl.disable(gl.DEPTH_TEST);
@@ -324,7 +370,7 @@ const blogUrl = `${import.meta.env.BASE_URL}blog/`;
           for (const mesh of meshes) {gl.deleteBuffer(mesh.buffer); gl.deleteVertexArray(mesh.vao);}
           for (const compiled of programs) gl.deleteProgram(compiled);
           for (const ownedTexture of textures) gl.deleteTexture(ownedTexture);
-          gl.deleteFramebuffer(framebuffer); gl.deleteRenderbuffer(depthBuffer); gl.deleteVertexArray(fullscreen);
+          gl.deleteFramebuffer(coverageFramebuffer); gl.deleteFramebuffer(framebuffer); gl.deleteRenderbuffer(depthBuffer); gl.deleteVertexArray(fullscreen);
         },
       };
     }
@@ -513,7 +559,7 @@ const blogUrl = `${import.meta.env.BASE_URL}blog/`;
       }
       async function updateLOD() {
         if (!manifest || disposed) return;
-        const lod = camera.zoom < DETAIL_ZOOM ? 0 : 1;
+        const lod = targetLOD(manifest.zooms, camera.zoom);
         if (requestedLOD === lod) return;
         const version = ++loadVersion;
         requestedLOD = lod;
@@ -637,11 +683,12 @@ const blogUrl = `${import.meta.env.BASE_URL}blog/`;
         }).catch((error) => {if (!disposed) console.error("Labels load failed", error);});
         manifest = await fetchJSON<Manifest>(`${import.meta.env.BASE_URL}data/tiles/manifest.json`);
         await updateLOD();
-        if (!disposed && manifest.zooms.some((level) => level.z === 1)) {
+        const nextLevel = manifest.zooms.filter((level) => activeLOD !== null && level.z > activeLOD).sort((first, second) => first.z - second.z)[0];
+        if (!disposed && nextLevel) {
           preloadTimer = setTimeout(() => {
             preloadTimer = null;
-            void getTerrain(1).then((terrain) => {
-              if (!disposed && !contextLost && renderer && !gpuMeshes.has(1)) gpuMeshes.set(1, renderer.upload(terrain));
+            void getTerrain(nextLevel.z).then((terrain) => {
+              if (!disposed && !contextLost && renderer && !gpuMeshes.has(nextLevel.z)) gpuMeshes.set(nextLevel.z, renderer.upload(terrain));
             }).catch((error) => {if (!disposed) console.warn("High-detail terrain preload failed", error);});
           }, 500);
         }
